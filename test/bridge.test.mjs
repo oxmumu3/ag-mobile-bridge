@@ -298,13 +298,15 @@ import Vision
 import AppKit
 let url = URL(fileURLWithPath: CommandLine.arguments[1])
 let req = VNDetectBarcodesRequest()
+req.usesCPUOnly = true
 let handler = VNImageRequestHandler(url: url, options: [:])
 try handler.perform([req])
 let payload = req.results?.first?.payloadStringValue ?? ""
 print(payload)
 `,
   );
-  const decoded = execFileSync('/usr/bin/swift', [swiftSrc, qrPng], { encoding: 'utf8', timeout: 60000 }).trim();
+  const rawOut = execFileSync('/usr/bin/swift', [swiftSrc, qrPng], { encoding: 'utf8', timeout: 60000 }).trim();
+  const decoded = rawOut.split(/\r?\n/).find((line) => line.startsWith('agmobile://')) || rawOut;
   assert.equal(decoded, uri);
 });
 
