@@ -18,6 +18,7 @@ import {
   startRendezvousPublisher,
 } from '../lib/rendezvous.mjs';
 import { startBridgeServer } from '../lib/server.mjs';
+import { rewriteInboundAcpMessage } from '../lib/acp-hub.mjs';
 import { cleanLineNoise, parseTranscriptConversation } from '../lib/sessions.mjs';
 import { browseWorkspaceDir, decodeWorkspacePath } from '../lib/workspaces.mjs';
 
@@ -1660,4 +1661,149 @@ test('Bridge exposes pending ask_question, requestFeedback artifacts, clears on 
   assert.equal(detPlanBody.status, 'question');
   assert.equal(detPlanBody.pendingFeedbackArtifact?.name, 'implementation_plan.md');
   assert.ok(detPlanBody.pendingFeedbackArtifact?.summary.includes('TestFlight'));
+});
+
+test('POST /api/uploads, ACP image hydration confinement, and transcript attachment rendering work end-to-end', async (t) => {
+  const fx = makeTempFixture();
+  t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
+
+  const srv = await startBridgeServer({
+    stateDir: fx.stateDir,
+    port: 0,
+    host: '127.0.0.1',
+    homeDir: fx.homeDir,
+    brainRoots: fx.brainRoots,
+    dbPaths: fx.dbPaths,
+    agyBin: fx.mockAgyPath,
+    enableBonjour: false,
+    enableWatch: false,
+    maxUploadBytes: 4096,
+  });
+  t.after(() => srv.stop());
+
+  const baseUrl = `http://127.0.0.1:${srv.port}`;
+  const authHeaders = { Authorization: `Bearer ${srv.config.bearerToken}` };
+
+  // 1. Rejects unauthenticated uploads (401) & oversized payloads (413)
+  const unauthRes = await fetch(`${baseUrl}/api/uploads?filename=test.png`, {
+    method: 'POST',
+    body: Buffer.from([1, 2, 3]),
+  });
+  assert.equal(unauthRes.status, 401);
+
+  const tooBigRes = await fetch(`${baseUrl}/api/uploads?filename=big.bin`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: Buffer.alloc(5000, 0x41),
+  });
+  assert.equal(tooBigRes.status, 413);
+
+  // 2. Uploads UTF-8 image & PDF, serves back exact bytes via signed previewPath
+  const pngBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const upImgRes = await fetch(
+    `${baseUrl}/api/uploads?filename=${encodeURIComponent('报错截图 1.png')}&mimeType=${encodeURIComponent('image/png')}&sessionId=${fx.convDesktopId}`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
+      body: pngBytes,
+    },
+  );
+  assert.equal(upImgRes.status, 200);
+  const { upload: imgUpload } = await upImgRes.json();
+  assert.equal(imgUpload.name, '报错截图 1.png');
+  assert.equal(imgUpload.kind, 'image');
+  assert.equal(imgUpload.mimeType, 'image/png');
+  assert.equal(imgUpload.sizeBytes, pngBytes.length);
+  assert.ok(imgUpload.fileUri.startsWith('file:///'));
+  assert.ok(imgUpload.previewPath.startsWith('/api/artifacts/file/'));
+
+  const dlImgRes = await fetch(`${baseUrl}${imgUpload.previewPath}`);
+  assert.equal(dlImgRes.status, 200);
+  assert.deepEqual(Buffer.from(await dlImgRes.arrayBuffer()), pngBytes);
+
+  const pdfBytes = Buffer.from('%PDF-1.4 sample document\n', 'utf8');
+  const upPdfRes = await fetch(
+    `${baseUrl}/api/uploads?filename=${encodeURIComponent('季度报表.pdf')}&mimeType=${encodeURIComponent('application/pdf')}&sessionId=${fx.convDesktopId}`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
+      body: pdfBytes,
+    },
+  );
+  assert.equal(upPdfRes.status, 200);
+  const { upload: pdfUpload } = await upPdfRes.json();
+  assert.equal(pdfUpload.name, '季度报表.pdf');
+  assert.equal(pdfUpload.kind, 'pdf');
+
+  // 3. rewriteInboundAcpMessage hydrates confined upload images -> native `image`, keeps PDF as `resource_link`,
+  //    refuses files outside `<stateDir>/uploads`, and injects fallback text when prompt text is empty.
+  const outsideImgPath = path.join(fx.homeDir, 'secret-outside.png');
+  fs.writeFileSync(outsideImgPath, pngBytes);
+  const outsideUri = `file://${outsideImgPath}`;
+
+  const rewrittenRaw = rewriteInboundAcpMessage(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'session/prompt',
+      params: {
+        sessionId: fx.convDesktopId,
+        prompt: [
+          { type: 'resource_link', uri: imgUpload.fileUri, name: imgUpload.name, mimeType: 'image/png', size: imgUpload.sizeBytes },
+          { type: 'resource_link', uri: pdfUpload.fileUri, name: pdfUpload.name, mimeType: 'application/pdf', size: pdfUpload.sizeBytes },
+          { type: 'resource_link', uri: outsideUri, name: 'secret-outside.png', mimeType: 'image/png', size: pngBytes.length },
+        ],
+      },
+    }),
+    { stateDir: fx.stateDir },
+  );
+  const rewritten = JSON.parse(rewrittenRaw);
+  assert.equal(rewritten.params.prompt.length, 4);
+  assert.equal(rewritten.params.prompt[0].type, 'text');
+  assert.ok(rewritten.params.prompt[0].text.length > 0);
+  assert.deepEqual(rewritten.params.prompt[1], {
+    type: 'image',
+    mimeType: 'image/png',
+    data: pngBytes.toString('base64'),
+  });
+  assert.equal(rewritten.params.prompt[2].type, 'resource_link');
+  assert.equal(rewritten.params.prompt[2].uri, pdfUpload.fileUri);
+  // Outside path MUST remain un-hydrated (never read arbitrary host files)
+  assert.equal(rewritten.params.prompt[3].type, 'resource_link');
+  assert.equal(rewritten.params.prompt[3].uri, outsideUri);
+
+  // 4. Session detail parses both `media` and `@[/.../uploads/...]` into clean `attachments` with previewPaths
+  const logsPath = path.join(fx.brainRoots[0].dir, fx.convDesktopId, '.system_generated', 'logs', 'transcript.jsonl');
+  const nowMs = Date.now();
+  const mediaSteps = [
+    {
+      step_index: 0,
+      type: 'USER_INPUT',
+      content: `<USER_REQUEST>\nPlease inspect the attached file(s).@[${pdfUpload.macPath}]\n</USER_REQUEST>`,
+      media: [{ mime_type: 'image/png', uri: imgUpload.macPath }],
+      created_at: new Date(nowMs - 2000).toISOString(),
+    },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      content: 'Parsed both screenshot and PDF report.',
+      tool_calls: [],
+      created_at: new Date(nowMs - 1000).toISOString(),
+    },
+  ];
+  fs.writeFileSync(logsPath, mediaSteps.map((s) => JSON.stringify(s)).join('\n') + '\n');
+
+  const detRes = await fetch(`${baseUrl}/api/sessions/${fx.convDesktopId}`, { headers: authHeaders });
+  assert.equal(detRes.status, 200);
+  const detBody = await detRes.json();
+  const userMsg = detBody.messages.find((m) => m.role === 'user');
+  assert.ok(userMsg);
+  assert.equal(userMsg.text, ''); // synthetic fallback + @[path] cleanly stripped
+  assert.equal(userMsg.attachments?.length, 2);
+  assert.equal(userMsg.attachments[0].name, '报错截图 1.png');
+  assert.equal(userMsg.attachments[0].kind, 'image');
+  assert.ok(userMsg.attachments[0].previewPath?.startsWith('/api/artifacts/file/'));
+  assert.equal(userMsg.attachments[1].name, '季度报表.pdf');
+  assert.equal(userMsg.attachments[1].kind, 'pdf');
+  assert.ok(detBody.lastPrompt.startsWith('📎 '));
 });
