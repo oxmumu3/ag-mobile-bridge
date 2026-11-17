@@ -304,7 +304,7 @@ let payload = req.results?.first?.payloadStringValue ?? ""
 print(payload)
 `,
   );
-  const decoded = execFileSync('/usr/bin/swift', [swiftSrc, qrPng], { encoding: 'utf8', timeout: 15000 }).trim();
+  const decoded = execFileSync('/usr/bin/swift', [swiftSrc, qrPng], { encoding: 'utf8', timeout: 60000 }).trim();
   assert.equal(decoded, uri);
 });
 

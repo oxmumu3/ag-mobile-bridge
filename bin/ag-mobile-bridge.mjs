@@ -450,6 +450,10 @@ async function cmdPushWechat() {
 
 async function main() {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
+  if (flags.help || flags.h || cmd === 'help') {
+    console.log(`Usage: ag-mobile-bridge <serve|pair|pin|doctor|push-wechat|install-agent|uninstall-agent>`);
+    return;
+  }
   if (cmd === 'serve') return cmdServe(flags);
   if (cmd === 'pair') return cmdPair(flags);
   if (cmd === 'pin') return cmdPin(flags);
