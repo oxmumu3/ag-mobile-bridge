@@ -1,0 +1,40 @@
+{
+  "name": "ag-mobile-bridge",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Local Mac unified daemon bridge for AG Mobile Bridge (Antigravity iOS client): read-only desktop transcript/SQLite aggregation, ACP WebSocket hub, Bonjour & LAN/Tunnel encrypted pairing",
+  "type": "module",
+  "bin": {
+    "ag-mobile-bridge": "./bin/ag-mobile-bridge.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "start": "node ./bin/ag-mobile-bridge.mjs serve"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oxmumu3/ag-mobile-bridge.git"
+  },
+  "homepage": "https://github.com/oxmumu3/ag-mobile-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/oxmumu3/ag-mobile-bridge/issues"
+  },
+  "keywords": [
+    "antigravity",
+    "acp",
+    "ios",
+    "remote-agent",
+    "ai-coding",
+    "mcp"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT"
+}
