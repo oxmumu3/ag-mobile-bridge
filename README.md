@@ -11,19 +11,27 @@
 
 环境要求：**macOS** · **Node.js `>= 22`** · **Antigravity (`agy`)**
 
-### 1. 在 Mac 上启动常驻守护桥并扫码配对
+### 最简单：两步免命令行上手 / 2-Step Zero-CLI Setup（推荐）
+
+1. **在电脑端安装并启动守护桥** —— 复制下面这句直接发给电脑上的 Antigravity（中文 / English 任选其一）：
+   - **中文：** `请从 https://github.com/oxmumu3/ag-mobile-bridge 把 Mac 守护桥安装到 ~/.local/share/ag-mobile-bridge，运行 install-agent 启动后台常驻服务，再运行 pair 把 6 位配对码和二维码发给我。`
+   - **English:** `Install the Mac companion daemon from https://github.com/oxmumu3/ag-mobile-bridge into ~/.local/share/ag-mobile-bridge, run install-agent to start the background service, then run pair and show me the 6-digit PIN and QR code.`
+2. **在手机端按引导配对** —— 在 iPhone 上免费下载 [**AG Mobile Bridge**](https://apps.apple.com/app/ag-mobile-bridge/id6835076436)，打开后跟随引导操作：
+   - **同 Wi-Fi**：直接输入 Mac 给出的 **6 位数字配对码**（App 会自动发现同一局域网下的 Mac）；
+   - **异地 / 跨网**：扫一下 Mac 终端输出的**二维码**，即自动打通后续 Wi-Fi ↔ 5G 切换重连。
+
+### 可选：手动终端命令 / Manual CLI
 
 ```bash
-# 方式 A：通过 npm（发布到 npmjs 后直接生效）
-npx ag-mobile-bridge install-agent
-npx ag-mobile-bridge pair
+# 通过 GitHub 克隆后长期挂载 LaunchAgent（推荐手动安装方式，零额外依赖）
+git clone https://github.com/oxmumu3/ag-mobile-bridge ~/.local/share/ag-mobile-bridge
+cd ~/.local/share/ag-mobile-bridge
+node ./bin/ag-mobile-bridge.mjs install-agent
+node ./bin/ag-mobile-bridge.mjs pair
 
-# 方式 B：通过 GitHub 直跑（无需提前等 npm 缓存）
-npx github:oxmumu3/ag-mobile-bridge install-agent
-npx github:oxmumu3/ag-mobile-bridge pair
+# 若已发布至 npmjs，也可直接使用 npx：
+# npx ag-mobile-bridge install-agent && npx ag-mobile-bridge pair
 ```
-
-打开 iPhone 上的 **AG Mobile Bridge**，同 Wi-Fi 下可直接输入屏幕弹窗中的 **6 位配对码**，或用相机扫描终端 **二维码**（自动附带局域网 + 异地加密隧道双路径）。
 
 ---
 
