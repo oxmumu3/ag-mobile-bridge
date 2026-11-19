@@ -48,6 +48,35 @@ function parseArgs(argv) {
   return { cmd: positional[0] || 'status', args: positional.slice(1), flags };
 }
 
+function getSystemdUnitPath() {
+  return path.join(os.homedir(), '.config', 'systemd', 'user', 'ag-mobile-bridge.service');
+}
+
+export function buildSystemdUserUnit({ nodeBin, entryScript, port, stateDir }) {
+  const logsDir = path.join(stateDir, 'logs');
+  ensurePrivateDir(logsDir);
+  const localBin = path.join(os.homedir(), '.local', 'bin');
+  const pathEnv = `${localBin}:/usr/local/bin:/usr/bin:/bin`;
+  return `[Unit]
+Description=Antigravity Mobile Bridge (Linux Remote Host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${nodeBin} ${entryScript} serve --port ${port}
+Restart=always
+RestartSec=3
+Environment=PATH=${pathEnv}
+Environment=AG_MOBILE_STATE_DIR=${stateDir}
+StandardOutput=append:${path.join(logsDir, 'stdout.log')}
+StandardError=append:${path.join(logsDir, 'stderr.log')}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
 function getPlistPath() {
   return path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`);
 }
@@ -241,8 +270,11 @@ async function cmdDoctor() {
 
   const report = {
     ok: Boolean(agyExists),
+    platform: process.platform,
     daemonRunning: Boolean(health),
-    launchAgentInstalled: fs.existsSync(getPlistPath()),
+    launchAgentInstalled: process.platform === 'linux'
+      ? fs.existsSync(getSystemdUnitPath())
+      : fs.existsSync(getPlistPath()),
     stateDir,
     port: config.port,
     lanUrl: `http://${lanIp}:${config.port}`,
@@ -326,6 +358,29 @@ async function cmdInstallAgent(flags) {
     stateDir,
     port: flags.port ? Number(flags.port) : DEFAULT_PORT,
   });
+
+  if (process.platform === 'linux') {
+    const unitPath = getSystemdUnitPath();
+    ensurePrivateDir(path.dirname(unitPath));
+    const unitBody = buildSystemdUserUnit({
+      nodeBin: process.execPath,
+      entryScript: BRIDGE_ENTRY,
+      port: config.port,
+      stateDir,
+    });
+    fs.writeFileSync(unitPath, unitBody, { mode: 0o644 });
+    try {
+      execFileSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'inherit' });
+      execFileSync('systemctl', ['--user', 'enable', '--now', 'ag-mobile-bridge.service'], { stdio: 'inherit' });
+      execFileSync('systemctl', ['--user', 'restart', 'ag-mobile-bridge.service'], { stdio: 'inherit' });
+    } catch (err) {
+      throw new Error(`Failed to enable systemd user service (${unitPath}): ${err.message}. Tip: run "loginctl enable-linger $USER" on headless servers.`);
+    }
+    console.log(`[ag-mobile-bridge] systemd user service installed and started: ${unitPath} (port ${config.port})`);
+    console.log('[ag-mobile-bridge] Tip: for 24/7 headless Linux SSH servers, run: loginctl enable-linger $USER');
+    return;
+  }
+
   const plistPath = getPlistPath();
   ensurePrivateDir(path.dirname(plistPath));
   const logsDir = path.join(stateDir, 'logs');
@@ -405,6 +460,21 @@ async function cmdInstallAgent(flags) {
 }
 
 function cmdUninstallAgent() {
+  if (process.platform === 'linux') {
+    const unitPath = getSystemdUnitPath();
+    try {
+      execFileSync('systemctl', ['--user', 'disable', '--now', 'ag-mobile-bridge.service'], { stdio: 'ignore' });
+    } catch {}
+    if (fs.existsSync(unitPath)) {
+      fs.unlinkSync(unitPath);
+    }
+    try {
+      execFileSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore' });
+    } catch {}
+    console.log('[ag-mobile-bridge] systemd user service removed.');
+    return;
+  }
+
   const plistPath = getPlistPath();
   const domain = getGuiDomain();
   try {

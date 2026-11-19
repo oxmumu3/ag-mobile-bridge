@@ -1807,3 +1807,126 @@ test('POST /api/uploads, ACP image hydration confinement, and transcript attachm
   assert.equal(userMsg.attachments[1].kind, 'pdf');
   assert.ok(detBody.lastPrompt.startsWith('📎 '));
 });
+
+test('Hydrates middle-truncated transcript_full.jsonl replies, signs safe workspace file:// links, and runs full-text search', async (t) => {
+  const fx = makeTempFixture();
+  t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
+
+  const logsDir = path.join(fx.brainRoots[0].dir, fx.convDesktopId, '.system_generated', 'logs');
+  const compactPath = path.join(logsDir, 'transcript.jsonl');
+  const fullPath = path.join(logsDir, 'transcript_full.jsonl');
+  const nowMs = Date.now();
+
+  const hiddenMiddle = '关键中间段落_ALPHA_778899_绝对不能被吞掉_'.repeat(30);
+  const fullReply = `开头说明。\n\n${hiddenMiddle}\n\n结尾总结。`;
+  const compactReply = '开头说明。\n<truncated 990 bytes>\n结尾总结。';
+
+  const compactSteps = [
+    {
+      step_index: 0,
+      type: 'USER_INPUT',
+      content: '<USER_REQUEST>\n帮我详细分析完整方案\n</USER_REQUEST>',
+      created_at: new Date(nowMs - 5000).toISOString(),
+    },
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      content: compactReply,
+      truncated_fields: ['content', 'thinking'],
+      tool_calls: [],
+      created_at: new Date(nowMs - 2000).toISOString(),
+    },
+  ];
+  const fullSteps = [
+    compactSteps[0],
+    {
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      content: fullReply,
+      tool_calls: [],
+      created_at: new Date(nowMs - 2000).toISOString(),
+    },
+  ];
+  fs.writeFileSync(compactPath, compactSteps.map((s) => JSON.stringify(s)).join('\n') + '\n');
+  fs.writeFileSync(fullPath, fullSteps.map((s) => JSON.stringify(s)).join('\n') + '\n');
+
+  // Create a readable workspace file and a sensitive .ssh key file
+  const codeFile = path.join(fx.wsAgent, 'sample.swift');
+  fs.writeFileSync(codeFile, 'struct Hello {\n    let value = 42\n}\n');
+  const sshDir = path.join(fx.homeDir, '.ssh');
+  fs.mkdirSync(sshDir, { recursive: true });
+  const sshKey = path.join(sshDir, 'id_ed25519');
+  fs.writeFileSync(sshKey, 'SECRET-PRIVATE-KEY');
+  const envFile = path.join(fx.wsAgent, '.env');
+  fs.writeFileSync(envFile, 'API_KEY=supersecret');
+
+  const srv = await startBridgeServer({
+    stateDir: fx.stateDir,
+    port: 0,
+    host: '127.0.0.1',
+    homeDir: fx.homeDir,
+    brainRoots: fx.brainRoots,
+    dbPaths: fx.dbPaths,
+    agyBin: fx.mockAgyPath,
+    enableBonjour: false,
+    enableWatch: false,
+  });
+  t.after(() => srv.stop());
+
+  const baseUrl = `http://127.0.0.1:${srv.port}`;
+  const authHeaders = { Authorization: `Bearer ${srv.config.bearerToken}`, 'Content-Type': 'application/json' };
+
+  // 1. Session detail MUST hydrate full content from transcript_full.jsonl with zero middle truncation
+  const detRes = await fetch(`${baseUrl}/api/sessions/${fx.convDesktopId}`, { headers: authHeaders });
+  assert.equal(detRes.status, 200);
+  const detBody = await detRes.json();
+  const assistantMsg = detBody.messages.find((m) => m.role === 'assistant');
+  assert.ok(assistantMsg);
+  assert.equal(assistantMsg.text, fullReply);
+  assert.ok(assistantMsg.text.includes('关键中间段落_ALPHA_778899'));
+  assert.equal(assistantMsg.text.includes('<truncated'), false);
+
+  // 2. POST /api/files/sign signs readable workspace files and blocks sensitive credentials
+  const okSign = await fetch(`${baseUrl}/api/files/sign`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ path: `file://${codeFile}#L1-L3` }),
+  });
+  assert.equal(okSign.status, 200);
+  const okSignBody = await okSign.json();
+  assert.equal(okSignBody.artifact.name, 'sample.swift');
+  assert.equal(okSignBody.artifact.kind, 'code');
+  const fileResp = await fetch(`${baseUrl}${okSignBody.artifact.previewPath}`);
+  assert.equal(fileResp.status, 200);
+  assert.equal(await fileResp.text(), 'struct Hello {\n    let value = 42\n}\n');
+
+  const sshBlocked = await fetch(`${baseUrl}/api/files/sign`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ path: sshKey }),
+  });
+  assert.equal(sshBlocked.status, 403);
+
+  const envBlocked = await fetch(`${baseUrl}/api/files/sign`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ path: envFile }),
+  });
+  assert.equal(envBlocked.status, 403);
+
+  const cfgBlocked = await fetch(`${baseUrl}/api/files/sign`, {
+    method: 'POST',
+    headers: authHeaders,
+    body: JSON.stringify({ path: path.join(fx.stateDir, 'config.json') }),
+  });
+  assert.equal(cfgBlocked.status, 403);
+
+  // 3. GET /api/sessions/search finds matches inside message bodies
+  const searchRes = await fetch(`${baseUrl}/api/sessions/search?q=${encodeURIComponent('帮我详细分析')}`, {
+    headers: authHeaders,
+  });
+  assert.equal(searchRes.status, 200);
+  const searchBody = await searchRes.json();
+  assert.equal(searchBody.ok, true);
+  assert.ok(searchBody.hits.some((h) => h.sessionId === fx.convDesktopId));
+});
