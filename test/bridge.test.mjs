@@ -1930,3 +1930,98 @@ test('Hydrates middle-truncated transcript_full.jsonl replies, signs safe worksp
   assert.equal(searchBody.ok, true);
   assert.ok(searchBody.hits.some((h) => h.sessionId === fx.convDesktopId));
 });
+
+test('Desktop live conversations/*.db running tool, compacting, waiting, and CASCADE_RUN_STATUS_BUSY never misreport interrupted', () => {
+  const fx = makeTempFixture();
+  try {
+    const brainDir = path.join(fx.brainRoots[0].dir, fx.convDesktopId);
+    const logsPath = path.join(brainDir, '.system_generated', 'logs', 'transcript.jsonl');
+    const convDir = path.join(path.dirname(fx.brainRoots[0].dir), 'conversations');
+    fs.mkdirSync(convDir, { recursive: true });
+    const convDbPath = path.join(convDir, `${fx.convDesktopId}.db`);
+
+    const nowMs = Date.now();
+    // Simulate a tool call emitted 3 minutes ago (beyond 60s!) with NO final reply yet
+    const steps = [
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        content: '<USER_REQUEST>\nRun long build\n</USER_REQUEST>',
+        created_at: new Date(nowMs - 200_000).toISOString(),
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        content: '',
+        tool_calls: [{ name: 'run_command', args: { CommandLine: 'xcodebuild' } }],
+        created_at: new Date(nowMs - 180_000).toISOString(),
+      },
+    ];
+    fs.writeFileSync(logsPath, steps.map((s) => JSON.stringify(s)).join('\n') + '\n');
+
+    // Case 1: conversations/<id>.db has compacting CHECKPOINT (step_type=23, status=2 RUNNING) even if dbMeta is IDLE
+    const db = new DatabaseSync(convDbPath);
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)');
+    db.prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)').run(2, 23, 2, null);
+    db.close();
+
+    const compactingRes = parseTranscriptConversation(logsPath, {
+      conversationId: fx.convDesktopId,
+      surface: 'desktop',
+      dbMeta: { dbStatus: 'CASCADE_RUN_STATUS_IDLE', notFullyIdle: false, killed: false, lastModifiedMs: nowMs - 180_000 },
+      nowMs,
+      includeMessages: true,
+    });
+    assert.equal(compactingRes.status, 'running');
+    assert.equal(compactingRes.activeTool, 'compacting');
+    assert.equal(compactingRes.inFlight, true);
+
+    // Case 2: conversations/<id>.db has WAITING step (status=9) -> 'question' (never interrupted)
+    const db2 = new DatabaseSync(convDbPath);
+    db2.prepare('UPDATE steps SET step_type = 132, status = 9 WHERE idx = 2').run();
+    db2.close();
+
+    const waitingRes = parseTranscriptConversation(logsPath, {
+      conversationId: fx.convDesktopId,
+      surface: 'desktop',
+      dbMeta: { dbStatus: 'CASCADE_RUN_STATUS_IDLE', notFullyIdle: false, killed: false, lastModifiedMs: nowMs - 180_000 },
+      nowMs,
+    });
+    assert.equal(waitingRes.status, 'question');
+
+    // Case 2b: conversations/<id>.db has live RUNNING tool step (step_type=132, status=2) 3 min old -> 'running'
+    const dbTool = new DatabaseSync(convDbPath);
+    dbTool.prepare('UPDATE steps SET step_type = 132, status = 2 WHERE idx = 2').run();
+    dbTool.close();
+
+    const liveToolRes = parseTranscriptConversation(logsPath, {
+      conversationId: fx.convDesktopId,
+      surface: 'desktop',
+      dbMeta: { dbStatus: 'CASCADE_RUN_STATUS_IDLE', notFullyIdle: false, killed: false, lastModifiedMs: nowMs - 180_000 },
+      nowMs,
+    });
+    assert.equal(liveToolRes.status, 'running');
+    assert.equal(liveToolRes.activeTool, 'run_command');
+
+    // Case 3: No live running step in .db, but dbMeta reports CASCADE_RUN_STATUS_BUSY -> 'running'
+    fs.unlinkSync(convDbPath);
+    const busyRes = parseTranscriptConversation(logsPath, {
+      conversationId: fx.convDesktopId,
+      surface: 'desktop',
+      dbMeta: { dbStatus: 'CASCADE_RUN_STATUS_BUSY', notFullyIdle: false, killed: false, lastModifiedMs: nowMs - 180_000 },
+      nowMs,
+    });
+    assert.equal(busyRes.status, 'running');
+
+    // Case 4: Truly dead session (no live .db row, IDLE dbMeta, 3 min old) -> honestly 'interrupted'
+    const deadRes = parseTranscriptConversation(logsPath, {
+      conversationId: fx.convDesktopId,
+      surface: 'desktop',
+      dbMeta: { dbStatus: 'CASCADE_RUN_STATUS_IDLE', notFullyIdle: false, killed: false, lastModifiedMs: nowMs - 180_000 },
+      nowMs,
+    });
+    assert.equal(deadRes.status, 'interrupted');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
