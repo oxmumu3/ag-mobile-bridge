@@ -19,7 +19,7 @@ import {
 } from '../lib/rendezvous.mjs';
 import { startBridgeServer } from '../lib/server.mjs';
 import { rewriteInboundAcpMessage } from '../lib/acp-hub.mjs';
-import { cleanLineNoise, parseTranscriptConversation } from '../lib/sessions.mjs';
+import { cleanLineNoise, collectOverview, getSessionDetail, parseTranscriptConversation } from '../lib/sessions.mjs';
 import { browseWorkspaceDir, decodeWorkspacePath } from '../lib/workspaces.mjs';
 
 function makeTempFixture() {
@@ -2021,6 +2021,55 @@ test('Desktop live conversations/*.db running tool, compacting, waiting, and CAS
       nowMs,
     });
     assert.equal(deadRes.status, 'interrupted');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('warm brand-new ACP session without transcript.jsonl returns clean detail (no 404) and appears in overview', () => {
+  const fx = makeTempFixture();
+  try {
+    const newId = '90afc5b3-8b21-4f7f-84ef-4bc03ad465fa';
+    const createdAtMs = Date.now();
+    const acpStates = {
+      [newId]: {
+        inFlight: false,
+        status: 'warm',
+        surface: 'desktop',
+        workspacePath: '/Users/demo/writing system',
+        createdAtMs,
+        activeTool: '',
+        startedAtMs: 0,
+        updatedAtMs: 0,
+        partialAssistantText: '',
+        pendingPermission: null,
+        pendingElicitation: null,
+        lastFailure: null,
+      },
+    };
+
+    const detail = getSessionDetail(newId, {
+      homeDir: fx.homeDir,
+      brainRoots: fx.brainRoots,
+      dbPaths: fx.dbPaths,
+      acpStates,
+    });
+    assert.ok(detail, 'brand-new warm ACP session must not return null (404)');
+    assert.equal(detail.id, newId);
+    assert.equal(detail.status, 'done');
+    assert.equal(detail.inFlight, false);
+    assert.equal(detail.workspaceName, 'writing system');
+    assert.deepEqual(detail.messages, []);
+
+    const overview = collectOverview({
+      homeDir: fx.homeDir,
+      brainRoots: fx.brainRoots,
+      dbPaths: fx.dbPaths,
+      acpStates,
+    });
+    const inOverview = overview.sessions.find((s) => s.id === newId);
+    assert.ok(inOverview, 'brand-new warm ACP session should appear in overview');
+    assert.equal(inOverview.status, 'done');
   } finally {
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
