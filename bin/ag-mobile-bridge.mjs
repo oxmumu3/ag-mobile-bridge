@@ -11,6 +11,7 @@ import {
   detectPrimaryLanIPv4,
   detectTailscaleFunnelUrl,
   detectTailscaleIPv4,
+  encodeCloudflareTunnelTokenFromCredFile,
   ensurePrivateDir,
   LAUNCH_AGENT_LABEL,
   loadOrCreateConfig,
@@ -309,10 +310,13 @@ async function cmdSetTunnel(flags) {
     console.log('[ag-mobile-bridge] Cleared custom Named Tunnel; reverted to automatic free Quick Tunnel. Run "ag-mobile-bridge restart" to apply.');
     return;
   }
-  const token = typeof flags.token === 'string' ? flags.token.trim() : '';
+  const credFile = typeof flags['cred-file'] === 'string' ? flags['cred-file'].trim() : '';
+  const token = credFile
+    ? encodeCloudflareTunnelTokenFromCredFile(credFile)
+    : (typeof flags.token === 'string' ? flags.token.trim() : '');
   const url = typeof flags.url === 'string' ? flags.url.trim().replace(/\/+$/, '') : '';
   if (!url || !/^https:\/\/.+/.test(url)) {
-    throw new Error('Usage: ag-mobile-bridge set-tunnel --url https://ag.yourdomain.com [--token <CLOUDFLARE_TUNNEL_TOKEN>] | --clear');
+    throw new Error('Usage: ag-mobile-bridge set-tunnel --url https://ag.yourdomain.com [--token <CLOUDFLARE_TUNNEL_TOKEN> | --cred-file ~/.cloudflared/<id>.json] | --clear');
   }
   loaded.config.funnelUrlOverride = url;
   if (token) {

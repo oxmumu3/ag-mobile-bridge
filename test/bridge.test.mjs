@@ -8,7 +8,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { buildPairUri, detectTailscaleFunnelUrl, writeJsonAtomic } from '../lib/config.mjs';
+import {
+  buildPairUri,
+  detectTailscaleFunnelUrl,
+  encodeCloudflareTunnelTokenFromCredFile,
+  writeJsonAtomic,
+} from '../lib/config.mjs';
 import { generateQrMatrix, renderQrHalfBlocks } from '../lib/qr-terminal.mjs';
 import {
   decryptRendezvousBeacon,
@@ -2198,5 +2203,29 @@ test('desktop-sync promotes mobile source=17 & projectId, prefers isolated launc
     if (prevNoNotify === undefined) delete process.env.AG_MOBILE_NO_NOTIFY;
     else process.env.AG_MOBILE_NO_NOTIFY = prevNoNotify;
     fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('encodeCloudflareTunnelTokenFromCredFile derives standard base64 connector token offline', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-cf-cred-'));
+  try {
+    const credPath = path.join(dir, 'sample-tunnel.json');
+    fs.writeFileSync(
+      credPath,
+      JSON.stringify({
+        AccountTag: 'acct-demo-123',
+        TunnelID: '00000000-1111-2222-3333-444444444444',
+        TunnelSecret: 'c2VjcmV0LWtleS1iYXNlNjQ=',
+      }),
+    );
+    const token = encodeCloudflareTunnelTokenFromCredFile(credPath);
+    const decoded = JSON.parse(Buffer.from(token, 'base64').toString('utf8'));
+    assert.deepEqual(decoded, {
+      a: 'acct-demo-123',
+      t: '00000000-1111-2222-3333-444444444444',
+      s: 'c2VjcmV0LWtleS1iYXNlNjQ=',
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
