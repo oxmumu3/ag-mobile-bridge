@@ -10,12 +10,15 @@ import {
   DEFAULT_PORT,
   detectPrimaryLanIPv4,
   detectTailscaleFunnelUrl,
+  detectTailscaleIPv4,
   ensurePrivateDir,
   LAUNCH_AGENT_LABEL,
   loadOrCreateConfig,
   resolveStateDir,
   rotatePin,
+  writeJsonAtomic,
 } from '../lib/config.mjs';
+import { resolveDesktopLauncherApp } from '../lib/desktop-sync.mjs';
 import { showMacPinNotification } from '../lib/notify.mjs';
 import { resolveIsolatedProxy } from '../lib/proxy.mjs';
 import { generateQrMatrix, renderQrHalfBlocks } from '../lib/qr-terminal.mjs';
@@ -191,11 +194,14 @@ async function cmdPair(flags) {
   const health = await probeLocalHealth(config.port);
   const lanIp = detectPrimaryLanIPv4();
   const lanUrl = health?.lanUrl || `http://${lanIp}:${config.port}`;
+  const tsIp = detectTailscaleIPv4();
+  const tailscaleUrl = health?.tailscaleUrl || (tsIp ? `http://${tsIp}:${config.port}` : null);
   const funnelUrl = health?.funnelUrl || detectTailscaleFunnelUrl(config.funnelUrlOverride, stateDir);
   const pairUri = buildPairUri({
     instanceId: config.instanceId,
     hostName: config.hostName,
     lanUrl,
+    tailscaleUrl,
     funnelUrl,
     token: config.bearerToken,
   });
@@ -267,6 +273,8 @@ async function cmdDoctor() {
   const dbMeta = readConversationDbMetadata([{ surface: 'desktop', path: dbPath }]);
   const funnelUrl = detectTailscaleFunnelUrl(config.funnelUrlOverride, stateDir);
   const lanIp = detectPrimaryLanIPv4();
+  const tsIp = detectTailscaleIPv4();
+  const launcher = resolveDesktopLauncherApp({ overrideApp: config.desktopLauncherApp });
 
   const report = {
     ok: Boolean(agyExists),
@@ -278,7 +286,10 @@ async function cmdDoctor() {
     stateDir,
     port: config.port,
     lanUrl: `http://${lanIp}:${config.port}`,
+    tailscaleUrl: tsIp ? `http://${tsIp}:${config.port}` : null,
     funnelUrl,
+    namedTunnelConfigured: Boolean(config.cloudflareTunnelToken && config.funnelUrlOverride),
+    desktopLauncher: launcher.supported ? launcher.appName : null,
     rendezvousTopicPrefix: `${deriveRendezvousTopic(config.bearerToken).slice(0, 14)}...`,
     agyBin,
     agyExists,
@@ -287,6 +298,28 @@ async function cmdDoctor() {
     sqliteReadonlyCount: dbMeta.size,
   };
   console.log(JSON.stringify(report, null, 2));
+}
+
+async function cmdSetTunnel(flags) {
+  const loaded = loadOrCreateConfig();
+  if (flags.clear) {
+    loaded.config.cloudflareTunnelToken = '';
+    loaded.config.funnelUrlOverride = '';
+    writeJsonAtomic(loaded.configPath, loaded.config, 0o600);
+    console.log('[ag-mobile-bridge] Cleared custom Named Tunnel; reverted to automatic free Quick Tunnel. Run "ag-mobile-bridge restart" to apply.');
+    return;
+  }
+  const token = typeof flags.token === 'string' ? flags.token.trim() : '';
+  const url = typeof flags.url === 'string' ? flags.url.trim().replace(/\/+$/, '') : '';
+  if (!url || !/^https:\/\/.+/.test(url)) {
+    throw new Error('Usage: ag-mobile-bridge set-tunnel --url https://ag.yourdomain.com [--token <CLOUDFLARE_TUNNEL_TOKEN>] | --clear');
+  }
+  loaded.config.funnelUrlOverride = url;
+  if (token) {
+    loaded.config.cloudflareTunnelToken = token;
+  }
+  writeJsonAtomic(loaded.configPath, loaded.config, 0o600);
+  console.log(`[ag-mobile-bridge] Saved permanent HTTPS tunnel URL: ${url} (Named Tunnel token: ${token ? 'configured' : 'unchanged'}). Run "ag-mobile-bridge restart" to apply.`);
 }
 
 async function reloadLaunchAgentNow(plistPath) {
@@ -495,11 +528,14 @@ async function cmdPushWechat() {
   const health = await probeLocalHealth(config.port);
   const lanIp = detectPrimaryLanIPv4();
   const lanUrl = health?.lanUrl || `http://${lanIp}:${config.port}`;
+  const tsIp = detectTailscaleIPv4();
+  const tailscaleUrl = health?.tailscaleUrl || (tsIp ? `http://${tsIp}:${config.port}` : null);
   const funnelUrl = health?.funnelUrl || detectTailscaleFunnelUrl(config.funnelUrlOverride, stateDir);
   const pairUri = buildPairUri({
     instanceId: config.instanceId,
     hostName: config.hostName,
     lanUrl,
+    tailscaleUrl,
     funnelUrl,
     token: config.bearerToken,
   });
@@ -521,18 +557,19 @@ async function cmdPushWechat() {
 async function main() {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
   if (flags.help || flags.h || cmd === 'help') {
-    console.log(`Usage: ag-mobile-bridge <serve|pair|pin|doctor|push-wechat|install-agent|uninstall-agent>`);
+    console.log('Usage: ag-mobile-bridge <serve|pair|pin|doctor|set-tunnel|push-wechat|install-agent|uninstall-agent>');
     return;
   }
   if (cmd === 'serve') return cmdServe(flags);
   if (cmd === 'pair') return cmdPair(flags);
   if (cmd === 'pin') return cmdPin(flags);
   if (cmd === 'doctor' || cmd === 'status') return cmdDoctor();
+  if (cmd === 'set-tunnel') return cmdSetTunnel(flags);
   if (cmd === 'push-wechat') return cmdPushWechat();
   if (cmd === 'install-agent' || cmd === 'restart') return cmdInstallAgent(flags);
   if (cmd === 'uninstall-agent') return cmdUninstallAgent();
 
-  console.log(`Usage: ag-mobile-bridge <serve|pair|pin|doctor|push-wechat|install-agent|uninstall-agent>`);
+  console.log('Usage: ag-mobile-bridge <serve|pair|pin|doctor|set-tunnel|push-wechat|install-agent|uninstall-agent>');
 }
 
 main().catch((err) => {

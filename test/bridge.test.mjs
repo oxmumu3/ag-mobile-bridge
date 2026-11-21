@@ -19,6 +19,13 @@ import {
 } from '../lib/rendezvous.mjs';
 import { startBridgeServer } from '../lib/server.mjs';
 import { rewriteInboundAcpMessage } from '../lib/acp-hub.mjs';
+import {
+  createDesktopSyncManager,
+  inspectTrajectoryDbStats,
+  promoteConversationForDesktop,
+  resolveDesktopLauncherApp,
+  resolveDesktopProjectForCwd,
+} from '../lib/desktop-sync.mjs';
 import { cleanLineNoise, collectOverview, getSessionDetail, parseTranscriptConversation } from '../lib/sessions.mjs';
 import { browseWorkspaceDir, decodeWorkspacePath } from '../lib/workspaces.mjs';
 
@@ -2071,6 +2078,125 @@ test('warm brand-new ACP session without transcript.jsonl returns clean detail (
     assert.ok(inOverview, 'brand-new warm ACP session should appear in overview');
     assert.equal(inOverview.status, 'done');
   } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('desktop-sync promotes mobile source=17 & projectId, prefers isolated launcher app, detects overwrite regression, and restores backup', () => {
+  const prevNoNotify = process.env.AG_MOBILE_NO_NOTIFY;
+  process.env.AG_MOBILE_NO_NOTIFY = '1';
+  const fx = makeTempFixture();
+  try {
+    // 1. Custom launcher app auto-detection in ~/Applications
+    const customLauncher = path.join(fx.homeDir, 'Applications', 'Antigravity CustomExit.app');
+    fs.mkdirSync(path.join(customLauncher, 'Contents', 'Helpers'), { recursive: true });
+    fs.writeFileSync(path.join(customLauncher, 'Contents', 'Helpers', 'mihomo'), '#!/bin/sh\n');
+    if (process.platform === 'darwin') {
+      const detected = resolveDesktopLauncherApp({ homeDir: fx.homeDir });
+      assert.equal(detected.appPath, customLauncher);
+      assert.equal(detected.appName, 'Antigravity CustomExit');
+      assert.equal(detected.isCustomLauncher, true);
+    }
+
+    // 2. Register a Desktop project in ~/.gemini/config/projects/
+    const projId = 'c80aac21-c8ac-421b-a3c0-f83169d6d106';
+    const projectsDir = path.join(fx.homeDir, '.gemini', 'config', 'projects');
+    fs.mkdirSync(projectsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectsDir, `${projId}.json`),
+      JSON.stringify({
+        id: projId,
+        name: 'demo-agent',
+        isWorkspaceOnly: true,
+        projectResources: {
+          resources: [{ folderUri: `file://${fx.wsAgent}` }],
+        },
+      }),
+    );
+
+    const matchedProj = resolveDesktopProjectForCwd(fx.wsAgent, { homeDir: fx.homeDir });
+    assert.equal(matchedProj.matched, true);
+    assert.equal(matchedProj.projectId, projId);
+
+    // 3. Simulate a mobile-created trajectory (.db) with source=17 and default-cli-project in summaries DB
+    const mobileConvId = '7f6e60dd-414c-4864-b421-c7367eefd1ae';
+    const desktopDir = path.join(fx.homeDir, '.gemini', 'antigravity');
+    const convDir = path.join(desktopDir, 'conversations');
+    fs.mkdirSync(convDir, { recursive: true });
+    const convDbPath = path.join(convDir, `${mobileConvId}.db`);
+
+    const cdb = new DatabaseSync(convDbPath);
+    cdb.exec(`
+      CREATE TABLE trajectory_meta (trajectory_id TEXT, cascade_id TEXT, trajectory_type INTEGER, source INTEGER);
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER);
+    `);
+    cdb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, ?, ?)').run('t-1', mobileConvId, 4, 17);
+    cdb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', Buffer.alloc(0));
+    for (let i = 0; i <= 5; i += 1) {
+      cdb.prepare('INSERT INTO steps VALUES (?, ?, ?)').run(i, 1, 3);
+    }
+    cdb.close();
+
+    const sdb = new DatabaseSync(fx.dbPaths[0].path);
+    try { sdb.exec('ALTER TABLE conversation_summaries ADD COLUMN project_id TEXT;'); } catch {}
+    try { sdb.exec('ALTER TABLE conversation_summaries ADD COLUMN source TEXT;'); } catch {}
+    sdb.prepare(
+      'INSERT OR REPLACE INTO conversation_summaries (conversation_id, title, project_id, source, workspace_uris) VALUES (?, ?, ?, ?, ?)',
+    ).run(
+      mobileConvId,
+      '',
+      'default-cli-project',
+      '17',
+      JSON.stringify(['file:///', `file://${fx.wsAgent}`]),
+    );
+    sdb.close();
+
+    const promo = promoteConversationForDesktop(mobileConvId, {
+      homeDir: fx.homeDir,
+      workspacePath: fx.wsAgent,
+      prompt: '<USER_REQUEST>\n移动端新建任务测试\n</USER_REQUEST>',
+      updateSummariesDb: true,
+    });
+    assert.equal(promo.ok, true);
+    assert.equal(promo.projectId, projId);
+    assert.equal(inspectTrajectoryDbStats(convDbPath).source, 1);
+
+    const sdbCheck = new DatabaseSync(fx.dbPaths[0].path, { open: true, readOnly: true });
+    const sumRow = sdbCheck.prepare('SELECT title, project_id, source, workspace_uris FROM conversation_summaries WHERE conversation_id = ?').get(mobileConvId);
+    sdbCheck.close();
+    assert.equal(sumRow.project_id, projId);
+    assert.equal(sumRow.source, '');
+    assert.equal(sumRow.title, '移动端新建任务测试');
+    assert.deepEqual(JSON.parse(sumRow.workspace_uris), [`file://${fx.wsAgent}`]);
+
+    // 4. Anti-overwrite backup & detection + 1-click restore
+    const syncMgr = createDesktopSyncManager({
+      stateDir: fx.stateDir,
+      homeDir: fx.homeDir,
+      getConfig: () => ({}),
+    });
+    syncMgr.recordMobileTurn(mobileConvId, {
+      workspacePath: fx.wsAgent,
+      prompt: '移动端第 6 步补充',
+    });
+
+    // Simulate stale Desktop memory overwriting steps 3..5 (leaving only idx 0..2)
+    const clobberDb = new DatabaseSync(convDbPath);
+    clobberDb.prepare('DELETE FROM steps WHERE idx > 2').run();
+    clobberDb.close();
+    assert.equal(inspectTrajectoryDbStats(convDbPath).maxIdx, 2);
+
+    const statusOverwritten = syncMgr.evaluateSyncStatus();
+    assert.equal(statusOverwritten.overwrittenSessionIds.includes(mobileConvId), true);
+
+    const restored = syncMgr.restoreBackupToDesktop(mobileConvId);
+    assert.equal(restored.ok, true);
+    assert.equal(inspectTrajectoryDbStats(convDbPath).maxIdx, 5);
+    assert.equal(syncMgr.evaluateSyncStatus().overwrittenSessionIds.includes(mobileConvId), false);
+  } finally {
+    if (prevNoNotify === undefined) delete process.env.AG_MOBILE_NO_NOTIFY;
+    else process.env.AG_MOBILE_NO_NOTIFY = prevNoNotify;
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
 });
